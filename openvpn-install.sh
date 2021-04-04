@@ -98,13 +98,27 @@ if [[ -e /etc/openvpn/server.conf ]]; then
 		case $option in
 			1)
 			echo ""
+			echo "now exists user list:"
+			ls /etc/openvpn/easy-rsa/pki/private/|grep -v server.key|grep -v ca.key|cut -d '.' -f 1
+			echo ""
 			echo "Tell me a name for the client cert"
 			echo "Please, use one word only, no special characters"
 			read -p "Client name: " -e -i client CLIENT
+			echo ""
+			echo "Now exists Static IP user:"
+			tail -n +1  /etc/openvpn/client/*
+			SERVERSUBNET=$(grep '^server ' /etc/openvpn/server.conf | cut -d " " -f 2)
+			read -p "Client Static IP(use dynamic ip please delete default value):" -e -i $SERVERSUBNET CLIENTSTATICIP
+			if [[ "$CLIENTSTATICIP" = '' ]]; then
+				echo "use dynamic ip."
+			else
+				echo "use static ip:$CLIENTSTATICIP"
+				echo "ifconfig-push $CLIENTSTATICIP 255.255.255.0" > /etc/openvpn/client/$CLIENT
+			fi
 			cd /etc/openvpn/easy-rsa/
 			./easyrsa build-client-full $CLIENT nopass
 			# Generates the custom client.ovpn
-			newclient "$CLIENT"
+			newclient "$CLIENT" "$CLIENTSTATICIP"
 			echo ""
 			echo "Client $CLIENT added, certs available at ~/$CLIENT.ovpn"
 			exit
@@ -143,26 +157,57 @@ if [[ -e /etc/openvpn/server.conf ]]; then
 			read -p "Do you really want to remove OpenVPN? [y/n]: " -e -i n REMOVE
 			if [[ "$REMOVE" = 'y' ]]; then
 				PORT=$(grep '^port ' /etc/openvpn/server.conf | cut -d " " -f 2)
+				SERVERSUBNET=$(grep '^server ' /etc/openvpn/server.conf | cut -d " " -f 2)
 				if pgrep firewalld; then
 					# Using both permanent and not permanent rules to avoid a firewalld reload.
-					firewall-cmd --zone=public --remove-port=$PORT/udp
-					firewall-cmd --zone=trusted --remove-source=10.8.0.0/24
-					firewall-cmd --permanent --zone=public --remove-port=$PORT/udp
-					firewall-cmd --permanent --zone=trusted --remove-source=10.8.0.0/24
+					if [[ "$PROTOCOL" = 'UDP' ]]; then
+						firewall-cmd --zone=public --remove-port=$PORT/udp
+						firewall-cmd --permanent --zone=public --remove-port=$PORT/udp
+					elif [[ "$PROTOCOL" = 'TCP' ]]; then
+						firewall-cmd --zone=public --remove-port=$PORT/tcp
+						firewall-cmd --permanent --zone=public --remove-port=$PORT/tcp
+					fi
+					firewall-cmd --zone=trusted --remove-source=$SERVERSUBNET/24
+					firewall-cmd --permanent --zone=trusted --remove-source=$SERVERSUBNET/24
 				fi
 				if iptables -L -n | grep -qE 'REJECT|DROP'; then
+					if [[ "$PROTOCOL" = 'UDP' ]]; then
 					sed -i "/iptables -I INPUT -p udp --dport $PORT -j ACCEPT/d" $RCLOCAL
-					sed -i "/iptables -I FORWARD -s 10.8.0.0\/24 -j ACCEPT/d" $RCLOCAL
+					elif [[ "$PROTOCOL" = 'TCP' ]]; then
+					sed -i "/iptables -I INPUT -p tcp --dport $PORT -j ACCEPT/d" $RCLOCAL
+					fi
+					sed -i "/iptables -I FORWARD -s $SERVERSUBNET\/24 -j ACCEPT/d" $RCLOCAL
 					sed -i "/iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT/d" $RCLOCAL
 				fi
-				sed -i '/iptables -t nat -A POSTROUTING -s 10.8.0.0\/24 -j SNAT --to /d' $RCLOCAL
+				sed -i '/iptables -t nat -A POSTROUTING -s $SERVERSUBNET\/24 -j SNAT --to /d' $RCLOCAL
 				if hash sestatus 2>/dev/null; then
 					if sestatus | grep "Current mode" | grep -qs "enforcing"; then
 						if [[ "$PORT" != '1194' ]]; then
-							semanage port -d -t openvpn_port_t -p udp $PORT
+							if [[ "$PROTOCOL" = 'UDP' ]]; then
+								semanage port -d -t openvpn_port_t -p udp $PORT
+							elif [[ "$PROTOCOL" = 'TCP' ]]; then
+								semanage port -d -t openvpn_port_t -p tcp $PORT
+							fi
 						fi
 					fi
 				fi
+
+				# stop OpenVPN service
+				if [[ "$OS" = 'debian' ]]; then
+					# Little hack to check for systemd
+					if pgrep systemd-journal; then
+						systemctl stop openvpn@server.service
+					else
+						/etc/init.d/openvpn stop
+					fi
+				else
+					if pgrep systemd-journal; then
+						systemctl stop openvpn@server.service
+					else
+						service openvpn stop
+					fi
+				fi
+
 				if [[ "$OS" = 'debian' ]]; then
 					apt-get remove --purge -y openvpn openvpn-blacklist
 				elif [[ "$OS" = 'arch' ]]; then
@@ -199,6 +244,9 @@ else
 	echo "What port do you want for OpenVPN?"
 	read -p "Port: " -e -i 1194 PORT
 	echo ""
+	echo "What subnet do you want for OpenVPN?"
+	read -p "subnet: " -e -i "10.8.0.0" SERVERSUBNET
+	echo ""
 	echo "What protocol do you want for OpenVPN?"
 	echo "Unless UDP is blocked, you should not use TCP (unnecessarily slower)"
 	while [[ $PROTOCOL != "UDP" && $PROTOCOL != "TCP" ]]; do
@@ -206,14 +254,23 @@ else
 	done
 	echo ""
 	echo "What DNS do you want to use with the VPN?"
+	echo "   0) no push dns server to client"
 	echo "   1) Current system resolvers (/etc/resolv.conf)"
 	echo "   2) FDN (France)"
 	echo "   3) DNS.WATCH (Germany)"
 	echo "   4) OpenDNS (Anycast: worldwide)"
 	echo "   5) Google (Anycast: worldwide)"
-	while [[ $DNS != "1" && $DNS != "2" && $DNS != "3" && $DNS != "4" && $DNS != "5" ]]; do
-		read -p "DNS [1-5]: " -e -i 2 DNS
+	while [[ $DNS != "0" && $DNS != "1" && $DNS != "2" && $DNS != "3" && $DNS != "4" && $DNS != "5" ]]; do
+		read -p "DNS [0-5]: " -e -i 0 DNS
 	done
+	echo ""
+	echo "Push VPN Server is geteway to Client ?"
+	echo "   0) no push "
+	echo "   1) push"
+	while [[ $PUSHGATEWAY != "0" && $PUSHGATEWAY != "1" ]]; do
+		read -p "push geteway [0-1]: " -e -i 0 PUSHGATEWAY
+	done
+
 	echo ""
 	echo "See https://github.com/SwiftfireDev/OpenVPN-install#encryption to learn more about "
 	echo "the encryption in OpenVPN and the choices I made in this script."
@@ -435,17 +492,20 @@ WantedBy=multi-user.target" > /etc/systemd/system/rc-local.service
 tun-mtu 1500
 tun-mtu-extra 32
 mssfix 1450
-reneg-sec 60
-user nobody
-group nogroup
+reneg-sec 3600
+#user nobody
+#group nogroup
 persist-key
 persist-tun
 keepalive 10 120
 topology subnet
-server 10.8.0.0 255.255.255.0
+server $SERVERSUBNET 255.255.255.0
 ifconfig-pool-persist /etc/openvpn/ipp.txt" >> /etc/openvpn/server.conf
 	# DNS resolvers
 	case $DNS in
+		0)
+		echo "no push dns server to client"
+		;;
 		1)
 		# Obtain the resolvers from resolv.conf and use them for OpenVPN
 		grep -v '#' /etc/resolv.conf | grep 'nameserver' | grep -E -o '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | while read line; do
@@ -469,11 +529,19 @@ ifconfig-pool-persist /etc/openvpn/ipp.txt" >> /etc/openvpn/server.conf
 		echo 'push "dhcp-option DNS 8.8.4.4"' >> /etc/openvpn/server.conf
 		;;
 	esac
-echo 'push "redirect-gateway def1 bypass-dhcp" '>> /etc/openvpn/server.conf
+
+	case $PUSHGATEWAY in
+		0)
+		echo "don't push gateway"
+		;;
+		1)
+		echo 'push "redirect-gateway def1 bypass-dhcp" '>> /etc/openvpn/server.conf
+		;;
+	esac
 
 # Change "max-clients 1" to desired number or comment out to remove limit
-echo "max-clients 1
-crl-verify /etc/openvpn/crl.pem
+echo "max-clients 1000
+#crl-verify /etc/openvpn/crl.pem
 ca /etc/openvpn/ca.crt
 cert /etc/openvpn/server.crt
 key /etc/openvpn/server.key
@@ -486,8 +554,15 @@ tls-version-min 1.2
 tls-cipher TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384
 status openvpn.log
 compress lz4
-verb 3" >> /etc/openvpn/server.conf
+verb 4
+log /var/log/openvpn-server.log
+client-config-dir /etc/openvpn/client
+client-to-client
+" >> /etc/openvpn/server.conf
 
+	#create client-config-dir
+	mkdir /etc/openvpn/client
+	
 	# Create the sysctl configuration file if needed (mainly for Arch Linux)
 	if [[ ! -e $SYSCTL ]]; then
 		touch $SYSCTL
@@ -501,8 +576,8 @@ verb 3" >> /etc/openvpn/server.conf
 	# Avoid an unneeded reboot
 	echo 1 > /proc/sys/net/ipv4/ip_forward
 	# Set NAT for the VPN subnet
-	iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j SNAT --to $IP
-	sed -i "1 a\iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j SNAT --to $IP" $RCLOCAL
+	iptables -t nat -A POSTROUTING -s $SERVERSUBNET/24 -j SNAT --to $IP
+	sed -i "1 a\iptables -t nat -A POSTROUTING -s $SERVERSUBNET/24 -j SNAT --to $IP" $RCLOCAL
 	if pgrep firewalld; then
 		# We don't use --add-service=openvpn because that would only work with
 		# the default port. Using both permanent and not permanent rules to
@@ -514,8 +589,8 @@ verb 3" >> /etc/openvpn/server.conf
 			firewall-cmd --zone=public --add-port=$PORT/tcp
 			firewall-cmd --permanent --zone=public --add-port=$PORT/tcp
 		fi
-		firewall-cmd --zone=trusted --add-source=10.8.0.0/24
-		firewall-cmd --permanent --zone=trusted --add-source=10.8.0.0/24
+		firewall-cmd --zone=trusted --add-source=$SERVERSUBNET/24
+		firewall-cmd --permanent --zone=trusted --add-source=$SERVERSUBNET/24
 	fi
 	if iptables -L -n | grep -qE 'REJECT|DROP'; then
 		# If iptables has at least one REJECT rule, we asume this is needed.
@@ -526,14 +601,14 @@ verb 3" >> /etc/openvpn/server.conf
 		elif [[ "$PROTOCOL" = 'TCP' ]]; then
 			iptables -I INPUT -p tcp --dport $PORT -j ACCEPT
 		fi
-		iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT
+		iptables -I FORWARD -s $SERVERSUBNET/24 -j ACCEPT
 		iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
 		if [[ "$PROTOCOL" = 'UDP' ]]; then
 			sed -i "1 a\iptables -I INPUT -p udp --dport $PORT -j ACCEPT" $RCLOCAL
 		elif [[ "$PROTOCOL" = 'TCP' ]]; then
 			sed -i "1 a\iptables -I INPUT -p tcp --dport $PORT -j ACCEPT" $RCLOCAL
 		fi
-		sed -i "1 a\iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT" $RCLOCAL
+		sed -i "1 a\iptables -I FORWARD -s $SERVERSUBNET/24 -j ACCEPT" $RCLOCAL
 		sed -i "1 a\iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" $RCLOCAL
 	fi
 	# If SELinux is enabled and a custom port was selected, we need this
@@ -574,11 +649,12 @@ verb 3" >> /etc/openvpn/server.conf
 	if [[ "$IP" != "$EXTERNALIP" ]]; then
 		echo ""
 		echo "Looks like your server is behind a NAT!"
+		echo "public ip is $EXTERNALIP"
 		echo ""
                 echo "If your server is NATed (e.g. LowEndSpirit, Scaleway, or behind a router),"
                 echo "then I need to know the address that can be used to access it from outside."
                 echo "If that's not the case, just ignore this and leave the next field blank"
-                read -p "External IP or domain name: " -e USEREXTERNALIP
+                read -p "External IP or domain name: " -e -i $EXTERNALIP USEREXTERNALIP
 		if [[ "$USEREXTERNALIP" != "" ]]; then
 			IP=$USEREXTERNALIP
 		fi
@@ -594,8 +670,8 @@ verb 3" >> /etc/openvpn/server.conf
 	fi
 	echo "remote $IP $PORT
 dev tun
-user nobody
-group nobody
+#user nobody
+#group nobody
 resolv-retry infinite
 tun-mtu 1500
 tun-mtu-extra 32
