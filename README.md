@@ -1,3 +1,23 @@
+## 2021.4.4
+change for build static ip vpn
+tested centos 7.9
+### New feature
+add static ip user config
+subnet config
+add select no push dns nopush gateway,default no push
+display External IP
+### Improvement
+reneg-sec to 3600
+delete user nobody group nogroup
+max-clients to 1000
+disable crl-verify
+verb 3 to 4
+add log file
+client-to-client
+### Bugfix
+fix remove function tcp udp
+fix remove add stop service
+
 ## This is a fork of https://github.com/Angristan/OpenVPN-install
 It's updated to the latest OpenVPN 2.4.2 release for Ubuntu 16.04 and uses tls-crypt to authenticate with AES GCM and ECDHE ciphers. 
 
